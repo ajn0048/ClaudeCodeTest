@@ -1,0 +1,273 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0
+// NQ Vol & Gamma Context — Strategy with Signal Scoring
+// Surfaces: RV vs IV divergence, expected range bands, structural levels, vol regime
+// Buy/Sell signals rated 1–10 based on technical confluence
+
+//@version=5
+strategy("NQ Vol & Gamma Context", overlay=true,
+         max_lines_count=20, max_labels_count=100,
+         initial_capital=50000,
+         default_qty_type=strategy.fixed, default_qty_value=1,
+         commission_type=strategy.commission.cash_per_contract,
+         commission_value=0.50,
+         currency=currency.USD,
+         pyramiding=0,
+         calc_on_every_tick=false)
+
+// ─────────────────────────────────────────────
+// INPUTS
+// ─────────────────────────────────────────────
+
+// Vol settings
+rv_length       = input.int(20,    "Realized Vol Length (days)", minval=5,   maxval=60,  group="Volatility")
+rv_short        = input.int(5,     "Short RV Length (days)",     minval=2,   maxval=20,  group="Volatility")
+iv_mult         = input.float(1.0, "IV Band Multiplier",         minval=0.5, maxval=2.0, step=0.1, group="Volatility")
+show_bands      = input.bool(true,  "Show Expected Range Bands",                          group="Volatility")
+show_regime_bg  = input.bool(true,  "Show Vol Regime Background",                         group="Volatility")
+
+// Structural levels
+show_pdhl       = input.bool(true,  "Show Prior Day High/Low",   group="Levels")
+show_on_range   = input.bool(true,  "Show Overnight Range",      group="Levels")
+show_rth_open   = input.bool(true,  "Show RTH Open (9:30 EST)",  group="Levels")
+show_labels     = input.bool(true,  "Show Level Labels",         group="Levels")
+
+// Signal scoring
+rsi_len         = input.int(14,  "RSI Length",                   minval=2,  maxval=50,  group="Signal Scoring")
+score_threshold = input.int(5,   "Min Score to Trade (1–10)",    minval=1,  maxval=10,  group="Signal Scoring")
+show_signals    = input.bool(true, "Show Signal Labels",                                 group="Signal Scoring")
+
+// Risk / exits
+atr_len         = input.int(14,   "ATR Length (stops)",          minval=2,  maxval=50,  group="Risk")
+atr_mult        = input.float(1.5, "ATR Stop Multiplier",        minval=0.5, maxval=5.0, step=0.25, group="Risk")
+
+// Session times (Exchange = America/New_York)
+rth_open_time   = input.session("0930-1600", "RTH Session",          group="Sessions")
+on_session      = input.session("1800-0930", "Overnight Session",     group="Sessions")
+
+// Colors
+col_rv_expand   = input.color(color.new(color.red,    80), "RV > IV Background",   group="Colors")
+col_rv_contract = input.color(color.new(color.green,  88), "RV < IV Background",   group="Colors")
+col_band_up     = input.color(color.new(color.orange, 60), "Upper Band",            group="Colors")
+col_band_dn     = input.color(color.new(color.orange, 60), "Lower Band",            group="Colors")
+col_pdh         = input.color(color.new(color.blue,    0), "Prior Day High",        group="Colors")
+col_pdl         = input.color(color.new(color.blue,    0), "Prior Day Low",         group="Colors")
+col_on_h        = input.color(color.new(color.purple,  0), "Overnight High",        group="Colors")
+col_on_l        = input.color(color.new(color.purple,  0), "Overnight Low",         group="Colors")
+col_rth_open    = input.color(color.new(color.yellow,  0), "RTH Open",              group="Colors")
+
+
+// ─────────────────────────────────────────────
+// VOL CALCULATIONS
+// ─────────────────────────────────────────────
+
+log_ret  = math.log(close / close[1])
+rv_20    = ta.stdev(log_ret, rv_length) * math.sqrt(252) * 100
+rv_5     = ta.stdev(log_ret, rv_short)  * math.sqrt(252) * 100
+
+vxn      = request.security("INDEX:VXN", timeframe.period, close)
+
+rv_gt_iv = rv_20 > vxn
+rv_lt_iv = rv_20 < vxn
+
+bgcolor(show_regime_bg and rv_gt_iv ? col_rv_expand   : na, title="RV > IV (Expanding)")
+bgcolor(show_regime_bg and rv_lt_iv ? col_rv_contract : na, title="RV < IV (Contracting)")
+
+
+// ─────────────────────────────────────────────
+// EXPECTED DAILY RANGE BANDS
+// Formula: price × (VXN/100) × sqrt(1/252) — uses 1.0 to force float division
+// ─────────────────────────────────────────────
+
+daily_move  = close * (vxn / 100) * math.sqrt(1.0 / 252) * iv_mult
+upper_band  = close + daily_move
+lower_band  = close - daily_move
+
+upper_plot  = plot(show_bands ? upper_band : na, "Upper Expected Move", col_band_up, linewidth=1, style=plot.style_line)
+lower_plot  = plot(show_bands ? lower_band : na, "Lower Expected Move", col_band_dn, linewidth=1, style=plot.style_line)
+fill(upper_plot, lower_plot, color=color.new(color.orange, 94), title="Expected Range Fill")
+
+
+// ─────────────────────────────────────────────
+// STRUCTURAL LEVELS
+// ─────────────────────────────────────────────
+
+// ── Prior Day High / Low ──
+// Uses request.security on the daily timeframe so PDH/PDL are accurate on all intraday TFs
+pd_high = request.security(syminfo.tickerid, "D", high[1], lookahead=barmerge.lookahead_off)
+pd_low  = request.security(syminfo.tickerid, "D", low[1],  lookahead=barmerge.lookahead_off)
+
+is_new_day = ta.change(time("D")) != 0
+
+var line pdh_line = na
+var line pdl_line = na
+
+if show_pdhl and is_new_day
+    line.delete(pdh_line)
+    line.delete(pdl_line)
+    pdh_line := line.new(bar_index, pd_high, bar_index + 1, pd_high, extend=extend.right, color=col_pdh, width=1, style=line.style_dashed)
+    pdl_line := line.new(bar_index, pd_low,  bar_index + 1, pd_low,  extend=extend.right, color=col_pdl, width=1, style=line.style_dashed)
+    if show_labels
+        label.new(bar_index, pd_high, "PDH " + str.tostring(pd_high, "#.00"), style=label.style_label_left, color=color.new(col_pdh, 80), textcolor=col_pdh, size=size.small)
+        label.new(bar_index, pd_low,  "PDL " + str.tostring(pd_low,  "#.00"), style=label.style_label_left, color=color.new(col_pdl, 80), textcolor=col_pdl, size=size.small)
+
+
+// ── RTH Open ──
+is_rth_open    = not na(time(timeframe.period, rth_open_time)) and na(time(timeframe.period, rth_open_time)[1])
+rth_open_price = ta.valuewhen(is_rth_open, open, 0)
+
+var line rth_line = na
+
+if show_rth_open and is_rth_open
+    line.delete(rth_line)
+    rth_line := line.new(bar_index, open, bar_index + 1, open, extend=extend.right, color=col_rth_open, width=1, style=line.style_dotted)
+    if show_labels
+        label.new(bar_index, open, "RTH Open " + str.tostring(open, "#.00"), style=label.style_label_left, color=color.new(col_rth_open, 80), textcolor=col_rth_open, size=size.small)
+
+
+// ── Overnight High / Low ──
+// Fixed: accumulator pattern instead of dynamic-length ta.highest/ta.lowest
+in_on_session = not na(time(timeframe.period, on_session))
+
+var float on_h_running = na
+var float on_l_running = na
+
+if not in_on_session[1] and in_on_session
+    on_h_running := high
+    on_l_running := low
+else if in_on_session
+    on_h_running := math.max(on_h_running, high)
+    on_l_running := math.min(on_l_running, low)
+
+var float on_h_val  = na
+var float on_l_val  = na
+var line  on_h_line = na
+var line  on_l_line = na
+
+if show_on_range and is_rth_open
+    on_h_val := on_h_running
+    on_l_val := on_l_running
+    line.delete(on_h_line)
+    line.delete(on_l_line)
+    on_h_line := line.new(bar_index, on_h_val, bar_index + 1, on_h_val, extend=extend.right, color=col_on_h, width=1, style=line.style_dashed)
+    on_l_line := line.new(bar_index, on_l_val, bar_index + 1, on_l_val, extend=extend.right, color=col_on_l, width=1, style=line.style_dashed)
+    if show_labels
+        label.new(bar_index, on_h_val, "ON High " + str.tostring(on_h_val, "#.00"), style=label.style_label_left, color=color.new(col_on_h, 80), textcolor=col_on_h, size=size.small)
+        label.new(bar_index, on_l_val, "ON Low "  + str.tostring(on_l_val, "#.00"), style=label.style_label_left, color=color.new(col_on_l, 80), textcolor=col_on_l, size=size.small)
+
+
+// ─────────────────────────────────────────────
+// SIGNAL SCORING (1–10)
+//
+// LONG factors (max 10):
+//   +3  price at or below lower expected band
+//   +2  vol contracting (RV < IV → mean-revert bias)
+//   +2  RSI < 35 (oversold) | +1 RSI < 45 (low)
+//   +1  price within 0.15% of overnight low
+//   +1  price within 0.15% of prior day low
+//   +1  short-term RV decelerating (rv_5 < rv_20)
+//
+// SHORT factors (max 10):
+//   +3  price at or above upper expected band
+//   +2  vol expanding (RV > IV → breakout/fade bias)
+//   +2  RSI > 65 (overbought) | +1 RSI > 55 (high)
+//   +1  price within 0.15% of overnight high
+//   +1  price within 0.15% of prior day high
+//   +1  short-term RV accelerating (rv_5 > rv_20)
+// ─────────────────────────────────────────────
+
+rsi = ta.rsi(close, rsi_len)
+atr = ta.atr(atr_len)
+
+_near(price, level) =>
+    not na(level) and math.abs(price - level) / price < 0.0015
+
+long_score = math.min(
+     (close <= lower_band             ? 3 : 0) +
+     (rv_lt_iv                        ? 2 : 0) +
+     (rsi < 35 ? 2 : rsi < 45 ? 1    : 0)     +
+     (_near(close, on_l_val)          ? 1 : 0) +
+     (_near(close, pd_low)            ? 1 : 0) +
+     (rv_5 < rv_20                    ? 1 : 0),
+     10)
+
+short_score = math.min(
+     (close >= upper_band             ? 3 : 0) +
+     (rv_gt_iv                        ? 2 : 0) +
+     (rsi > 65 ? 2 : rsi > 55 ? 1    : 0)     +
+     (_near(close, on_h_val)          ? 1 : 0) +
+     (_near(close, pd_high)           ? 1 : 0) +
+     (rv_5 > rv_20                    ? 1 : 0),
+     10)
+
+// Fire once when score rises to or past the threshold
+long_signal  = long_score  >= score_threshold and long_score[1]  < score_threshold
+short_signal = short_score >= score_threshold and short_score[1] < score_threshold
+
+if show_signals and long_signal
+    label.new(bar_index, low,  "▲ LONG\n" + str.tostring(long_score)  + "/10",
+              style=label.style_label_up,   color=color.new(color.green, 20),
+              textcolor=color.white, size=size.normal)
+
+if show_signals and short_signal
+    label.new(bar_index, high, "▼ SHORT\n" + str.tostring(short_score) + "/10",
+              style=label.style_label_down, color=color.new(color.red, 20),
+              textcolor=color.white, size=size.normal)
+
+
+// ─────────────────────────────────────────────
+// STRATEGY ENTRIES & EXITS
+// ─────────────────────────────────────────────
+
+if long_signal
+    strategy.entry("Long",  strategy.long,  comment="Score:" + str.tostring(long_score))
+
+if short_signal
+    strategy.entry("Short", strategy.short, comment="Score:" + str.tostring(short_score))
+
+// ATR-based stops; opposing band as profit target
+strategy.exit("Long Exit",  "Long",  stop=strategy.position_avg_price - atr * atr_mult, limit=upper_band)
+strategy.exit("Short Exit", "Short", stop=strategy.position_avg_price + atr * atr_mult, limit=lower_band)
+
+
+// ─────────────────────────────────────────────
+// INFO TABLE — top right corner
+// ─────────────────────────────────────────────
+
+var table info = table.new(position.top_right, 2, 8,
+     bgcolor=color.new(color.black, 70),
+     border_color=color.new(color.gray, 60), border_width=1,
+     frame_color=color.new(color.gray, 40),  frame_width=1)
+
+if barstate.islast
+    regime_str   = rv_gt_iv ? "EXPANDING ▲"   : "CONTRACTING ▼"
+    regime_color = rv_gt_iv ? color.red         : color.green
+    bias_str     = rv_gt_iv ? "Breakout bias"  : "Mean revert bias"
+
+    table.cell(info, 0, 0, "NQ VOL CONTEXT",  text_color=color.white,    text_size=size.small, bgcolor=color.new(color.gray, 60))
+    table.cell(info, 1, 0, "",                 text_color=color.white,    text_size=size.small, bgcolor=color.new(color.gray, 60))
+    table.cell(info, 0, 1, "VXN (IV)",         text_color=color.gray,     text_size=size.small)
+    table.cell(info, 1, 1, str.tostring(vxn,   "#.00") + "%", text_color=color.white,  text_size=size.small)
+    table.cell(info, 0, 2, "RV 20d",           text_color=color.gray,     text_size=size.small)
+    table.cell(info, 1, 2, str.tostring(rv_20, "#.00") + "%", text_color=color.white,  text_size=size.small)
+    table.cell(info, 0, 3, "RV 5d",            text_color=color.gray,     text_size=size.small)
+    table.cell(info, 1, 3, str.tostring(rv_5,  "#.00") + "%", text_color=color.white,  text_size=size.small)
+    table.cell(info, 0, 4, "REGIME",           text_color=color.gray,     text_size=size.small)
+    table.cell(info, 1, 4, regime_str,          text_color=regime_color,   text_size=size.small)
+    table.cell(info, 0, 5, "BIAS",             text_color=color.gray,     text_size=size.small)
+    table.cell(info, 1, 5, bias_str,            text_color=color.yellow,   text_size=size.small)
+    table.cell(info, 0, 6, "LONG Score",       text_color=color.gray,     text_size=size.small)
+    table.cell(info, 1, 6, str.tostring(long_score)  + "/10", text_color=color.lime,   text_size=size.small)
+    table.cell(info, 0, 7, "SHORT Score",      text_color=color.gray,     text_size=size.small)
+    table.cell(info, 1, 7, str.tostring(short_score) + "/10", text_color=color.red,    text_size=size.small)
+
+
+// ─────────────────────────────────────────────
+// ALERTS
+// ─────────────────────────────────────────────
+
+alertcondition(long_signal,               "Long Signal",                  "NQ Long signal — check score in table")
+alertcondition(short_signal,              "Short Signal",                 "NQ Short signal — check score in table")
+alertcondition(ta.crossover(rv_20, vxn),  "RV crossed ABOVE IV",          "Vol expanding: RV > IV — breakout bias")
+alertcondition(ta.crossunder(rv_20, vxn), "RV crossed BELOW IV",          "Vol contracting: RV < IV — mean revert bias")
+alertcondition(close >= upper_band,        "Price hit Upper Expected Move", "NQ reached upper expected daily range")
+alertcondition(close <= lower_band,        "Price hit Lower Expected Move", "NQ reached lower expected daily range")
