@@ -99,8 +99,8 @@ ema_slow = ta.ema(close, slow_len)
 plot(show_emas ? ema_fast : na, "Fast EMA", col_ema_fast, linewidth=2)
 plot(show_emas ? ema_slow : na, "Slow EMA", col_ema_slow, linewidth=2)
 
-adx_val = ta.adx(high, low, close, adx_len)
-adx_ok  = not na(adx_val) and adx_val > adx_threshold
+[dPlus, dMinus, adx_val] = ta.dmi(adx_len, adx_len)
+adx_ok = not na(adx_val) and adx_val > adx_threshold
 
 vol_ma = ta.sma(volume, vol_len)
 vol_ok = not use_vol_filter or (not na(volume) and not na(vol_ma) and volume > vol_ma)
@@ -145,8 +145,8 @@ bgcolor(show_trend_bg and ema_fast > ema_slow ? color.new(color.green, 93) : sho
 bgcolor(show_regime_bg and rv_gt_iv ? col_rv_expand : na, title="RV > IV")
 bgcolor(show_regime_bg and rv_lt_iv ? col_rv_contract : na, title="RV < IV")
 
-plotshape(show_trend_arrows and bull_signal, "Trend Buy", shape.triangleup, location.belowbar, color.new(col_buy, 10), 0, "Buy", na, true, size.small)
-plotshape(show_trend_arrows and bear_signal, "Trend Sell", shape.triangledown, location.abovebar, color.new(col_sell, 10), 0, "Sell", na, true, size.small)
+plotshape(show_trend_arrows and bull_signal, title="Trend Buy", style=shape.triangleup, location=location.belowbar, color=color.new(col_buy, 10), size=size.small, text="Buy")
+plotshape(show_trend_arrows and bear_signal, title="Trend Sell", style=shape.triangledown, location=location.abovebar, color=color.new(col_sell, 10), size=size.small, text="Sell")
 
 // ═══════════════════════════════════════════════════════════════════════════
 // BAR FREQUENCY → annualisation (drift & Ito step scaling)
@@ -268,8 +268,8 @@ ito_sell_raw =
 ito_buy  = ito_buy_raw and not ito_buy_raw[1]
 ito_sell = ito_sell_raw and not ito_sell_raw[1]
 
-plotshape(show_ito_sig and ito_buy, "Ito Buy", shape.diamond, location.belowbar, color.new(color.teal, 0), 0, na, na, true, size.tiny)
-plotshape(show_ito_sig and ito_sell, "Ito Sell", shape.diamond, location.abovebar, color.new(color.orange, 0), 0, na, na, true, size.tiny)
+plotshape(show_ito_sig and ito_buy, title="Ito Buy", style=shape.diamond, location=location.belowbar, color=color.new(color.teal, 0), size=size.tiny)
+plotshape(show_ito_sig and ito_sell, title="Ito Sell", style=shape.diamond, location=location.abovebar, color=color.new(color.orange, 0), size=size.tiny)
 
 // ═══════════════════════════════════════════════════════════════════════════
 // TABLE
