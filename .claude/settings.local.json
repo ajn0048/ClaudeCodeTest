@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(Start-Process \"C:\\\\Users\\\\HP\\\\OneDrive\\\\Desktop\\\\ClaudeCodeTest\\\\tictactoe.html\")"
+    ]
+  }
+}
