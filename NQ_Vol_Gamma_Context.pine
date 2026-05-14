@@ -60,8 +60,9 @@ plot(show_emas ? ema_slow : na, "Slow EMA", col_ema_slow, linewidth=2)
 // PHASE 4 — FILTERS
 // ─────────────────────────────────────────────
 
-adx_val = ta.adx(high, low, close, adx_len)
-adx_ok  = not na(adx_val) and adx_val > adx_threshold
+// ADX from DMI (portable; avoids ta.adx build differences)
+[dPlus, dMinus, adx_val] = ta.dmi(adx_len, adx_len)
+adx_ok = not na(adx_val) and adx_val > adx_threshold
 
 vol_ma = ta.sma(volume, vol_len)
 vol_ok = not use_vol_filter or (not na(volume) and not na(vol_ma) and volume > vol_ma)
@@ -87,8 +88,8 @@ bear_signal = bear_raw and adx_ok and vol_ok and htf_ok_short
 // Background: optional tint by EMA stack (not only on signal bar)
 bgcolor(show_trend_bg and ema_fast > ema_slow ? col_bull_bg : show_trend_bg and ema_fast < ema_slow ? col_bear_bg : na, title="Trend tint")
 
-plotshape(show_shapes and bull_signal, "Buy", shape.triangleup, location.belowbar, col_buy, 0, "Buy", na, true, size.small)
-plotshape(show_shapes and bear_signal, "Sell", shape.triangledown, location.abovebar, col_sell, 0, "Sell", na, true, size.small)
+plotshape(show_shapes and bull_signal, title="Buy", style=shape.triangleup, location=location.belowbar, color=col_buy, size=size.small, text="Buy")
+plotshape(show_shapes and bear_signal, title="Sell", style=shape.triangledown, location=location.abovebar, color=col_sell, size=size.small, text="Sell")
 
 // ─────────────────────────────────────────────
 // PHASE 5 — ALERTS
