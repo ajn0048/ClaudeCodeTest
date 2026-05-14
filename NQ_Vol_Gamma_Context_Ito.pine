@@ -1,0 +1,358 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0
+//
+// ═══════════════════════════════════════════════════════════════════════════
+// PHASE 1 — SIGNAL LOGIC (plain English)
+// ═══════════════════════════════════════════════════════════════════════════
+// Primary trend: fast EMA vs slow EMA on this chart. Buy = bullish crossover on the
+// bar where fast crosses above slow; Sell = bearish crossover. All enabled filters
+// (ADX, optional volume, optional HTF alignment, optional RV/IV gates) must pass.
+// This script is an indicator — exits are the opposite crossover; manage risk off-chart.
+// Secondary (optional): Ito GBM confluence dots — drift sign, price bar curvature,
+// and price at Ito band — independent of EMA crossover alerts.
+// ═══════════════════════════════════════════════════════════════════════════
+
+//@version=5
+indicator("NQ Trend + Vol & Ito Context", shorttitle="Trend+Vol", overlay=true,
+     max_lines_count=20, max_labels_count=100,
+     max_boxes_count=10, calc_on_every_tick=false)
+
+// ─────────────────────────────────────────────
+// INPUTS — Trend & filters (shared with base concept)
+// ─────────────────────────────────────────────
+
+fast_len        = input.int(20, "Fast EMA Length", minval=1, maxval=500, group="Trend")
+slow_len        = input.int(50, "Slow EMA Length", minval=1, maxval=500, group="Trend")
+use_htf         = input.bool(false, "Require HTF trend confirmation", group="Trend")
+htf_tf          = input.timeframe("240", "Higher timeframe", group="Trend")
+show_trend_bg   = input.bool(true, "Background: EMA trend tint", group="Trend")
+show_emas       = input.bool(true, "Plot EMAs", group="Trend")
+show_trend_arrows = input.bool(true, "Plot Buy / Sell (trend)", group="Trend")
+
+adx_len         = input.int(14, "ADX Length", minval=1, maxval=50, group="Filters")
+adx_threshold   = input.float(20.0, "ADX minimum", minval=0.0, maxval=100.0, step=0.5, group="Filters")
+use_vol_filter  = input.bool(false, "Require volume > SMA(volume)", group="Filters")
+vol_len         = input.int(20, "Volume SMA length", minval=1, maxval=500, group="Filters")
+
+// Optional extra gates for trend signals (default off = same as base)
+gate_long_rv_lt_iv  = input.bool(false, "BUY only if RV < IV (contracting)", group="Volatility gates")
+gate_long_rv_gt_iv   = input.bool(false, "BUY only if RV > IV (expanding)", group="Volatility gates")
+gate_short_rv_lt_iv = input.bool(false, "SELL only if RV < IV", group="Volatility gates")
+gate_short_rv_gt_iv = input.bool(false, "SELL only if RV > IV", group="Volatility gates")
+
+// ─────────────────────────────────────────────
+// INPUTS — Volatility & bands
+// ─────────────────────────────────────────────
+
+rv_length       = input.int(20, "Realized Vol Length (days)", minval=5, maxval=60, group="Volatility")
+rv_short        = input.int(5, "Short RV Length (days)", minval=2, maxval=20, group="Volatility")
+iv_mult         = input.float(1.0, "Band multiplier (IV + Ito)", minval=0.5, maxval=2.0, step=0.1, group="Volatility")
+show_bands      = input.bool(true, "Show symmetric IV bands (VXN)", group="Volatility")
+show_ito_bands  = input.bool(true, "Show Ito GBM bands", group="Volatility")
+show_regime_bg  = input.bool(true, "Show RV vs IV regime background", group="Volatility")
+
+// ─────────────────────────────────────────────
+// INPUTS — Levels
+// ─────────────────────────────────────────────
+
+show_pdhl       = input.bool(true, "Show Prior Day High/Low", group="Levels")
+show_on_range   = input.bool(true, "Show Overnight Range", group="Levels")
+show_rth_open   = input.bool(true, "Show RTH Open (9:30 session)", group="Levels")
+show_labels     = input.bool(true, "Show level labels", group="Levels")
+
+// ─────────────────────────────────────────────
+// INPUTS — Ito / drift
+// ─────────────────────────────────────────────
+
+drift_len       = input.int(60, "Drift SMA window (bars)", minval=10, maxval=500, group="Ito / drift")
+ito_sigma_source = input.string("RV20", "Ito σ source (annualised)", options=["RV20", "VXN"], group="Ito / drift")
+show_ito_table  = input.bool(true, "Show Ito rows in table", group="Ito / drift")
+show_ito_sig    = input.bool(true, "Show Ito confluence markers", group="Ito / drift")
+curv_flat_ticks = input.int(4, "Curvature flat: |Δ²close| ≤ N ticks", minval=0, maxval=100, group="Ito / drift")
+
+rth_open_time   = input.session("0930-1600", "RTH Session", group="Sessions")
+on_session      = input.session("1800-0930", "Overnight Session", group="Sessions")
+
+// Colors
+col_ema_fast    = input.color(color.new(color.white, 0), "Fast EMA", group="Colors")
+col_ema_slow    = input.color(color.new(color.gray, 30), "Slow EMA", group="Colors")
+col_rv_expand   = input.color(color.new(color.red, 80), "RV > IV Background", group="Colors")
+col_rv_contract = input.color(color.new(color.green, 88), "RV < IV Background", group="Colors")
+col_band_up     = input.color(color.new(color.orange, 60), "Upper IV band", group="Colors")
+col_band_dn     = input.color(color.new(color.orange, 60), "Lower IV band", group="Colors")
+col_ito_up      = input.color(color.new(color.teal, 50), "Ito upper", group="Colors")
+col_ito_dn      = input.color(color.new(color.teal, 50), "Ito lower", group="Colors")
+col_pdh         = input.color(color.new(color.blue, 0), "Prior day high", group="Colors")
+col_pdl         = input.color(color.new(color.blue, 0), "Prior day low", group="Colors")
+col_on_h        = input.color(color.new(color.purple, 0), "Overnight high", group="Colors")
+col_on_l        = input.color(color.new(color.purple, 0), "Overnight low", group="Colors")
+col_rth_open    = input.color(color.new(color.yellow, 0), "RTH open", group="Colors")
+col_buy         = input.color(color.new(color.lime, 0), "Trend Buy", group="Colors")
+col_sell        = input.color(color.new(color.red, 0), "Trend Sell", group="Colors")
+
+// ═══════════════════════════════════════════════════════════════════════════
+// TREND CORE + FILTERS
+// ═══════════════════════════════════════════════════════════════════════════
+
+ema_fast = ta.ema(close, fast_len)
+ema_slow = ta.ema(close, slow_len)
+
+plot(show_emas ? ema_fast : na, "Fast EMA", col_ema_fast, linewidth=2)
+plot(show_emas ? ema_slow : na, "Slow EMA", col_ema_slow, linewidth=2)
+
+adx_val = ta.adx(high, low, close, adx_len)
+adx_ok  = not na(adx_val) and adx_val > adx_threshold
+
+vol_ma = ta.sma(volume, vol_len)
+vol_ok = not use_vol_filter or (not na(volume) and not na(vol_ma) and volume > vol_ma)
+
+htf_bull = request.security(syminfo.tickerid, htf_tf, ta.ema(close, fast_len) > ta.ema(close, slow_len),
+     gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+htf_bear = request.security(syminfo.tickerid, htf_tf, ta.ema(close, fast_len) < ta.ema(close, slow_len),
+     gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+
+htf_ok_long  = not use_htf or htf_bull
+htf_ok_short = not use_htf or htf_bear
+
+// ═══════════════════════════════════════════════════════════════════════════
+// VOLATILITY (VXN + RV)
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Avoid log(0): prior close must be non-zero
+log_ret = close[1] != 0 and close > 0 ? math.log(close / close[1]) : na
+rv_20   = ta.stdev(log_ret, rv_length) * math.sqrt(252) * 100
+rv_5    = ta.stdev(log_ret, rv_short) * math.sqrt(252) * 100
+
+vxn = request.security("INDEX:VXN", timeframe.period, close)
+
+rv_gt_iv = rv_20 > vxn
+rv_lt_iv = rv_20 < vxn
+
+long_rv_gate_ok =
+     (not gate_long_rv_lt_iv or rv_lt_iv) and
+     (not gate_long_rv_gt_iv or rv_gt_iv)
+
+short_rv_gate_ok =
+     (not gate_short_rv_lt_iv or rv_lt_iv) and
+     (not gate_short_rv_gt_iv or rv_gt_iv)
+
+bull_raw = ta.crossover(ema_fast, ema_slow)
+bear_raw = ta.crossunder(ema_fast, ema_slow)
+
+bull_signal = bull_raw and adx_ok and vol_ok and htf_ok_long and long_rv_gate_ok
+bear_signal = bear_raw and adx_ok and vol_ok and htf_ok_short and short_rv_gate_ok
+
+bgcolor(show_trend_bg and ema_fast > ema_slow ? color.new(color.green, 93) : show_trend_bg and ema_fast < ema_slow ? color.new(color.red, 93) : na, title="EMA trend tint")
+bgcolor(show_regime_bg and rv_gt_iv ? col_rv_expand : na, title="RV > IV")
+bgcolor(show_regime_bg and rv_lt_iv ? col_rv_contract : na, title="RV < IV")
+
+plotshape(show_trend_arrows and bull_signal, "Trend Buy", shape.triangleup, location.belowbar, color.new(col_buy, 10), 0, "Buy", na, true, size.small)
+plotshape(show_trend_arrows and bear_signal, "Trend Sell", shape.triangledown, location.abovebar, color.new(col_sell, 10), 0, "Sell", na, true, size.small)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// BAR FREQUENCY → annualisation (drift & Ito step scaling)
+// μ̂ = mean(log return per bar) × bars_per_year  (calendar seconds; approx for 24h symbols)
+// ═══════════════════════════════════════════════════════════════════════════
+
+float bar_sec = math.max(timeframe.in_seconds(), 1.0)
+float bars_per_year = (365.25 * 24.0 * 60.0 * 60.0) / bar_sec
+
+// σ for Ito bands: realised 20d RV or VXN implied, as decimal (e.g. 0.20 = 20%)
+sigma_a = ito_sigma_source == "VXN" ? vxn / 100.0 : rv_20 / 100.0
+
+// Annualised drift from average log return per bar
+mu_a = ta.sma(log_ret, drift_len) * bars_per_year
+
+schoemaker = 0.5 * sigma_a * sigma_a
+ito_drift  = mu_a - schoemaker
+
+// One-bar log-drift and diffusion scale (consistent with bars_per_year)
+float ito_drift_1b = ito_drift / bars_per_year
+float sigma_1b     = sigma_a / math.sqrt(bars_per_year)
+
+ito_upper = close * math.exp(ito_drift_1b + sigma_1b * iv_mult)
+ito_lower = close * math.exp(ito_drift_1b - sigma_1b * iv_mult)
+
+vol_drag_on = schoemaker > math.abs(mu_a)
+
+// Price bar curvature: second difference of close over bars (NOT options gamma)
+price_bar_curvature = close - 2.0 * close[1] + close[2]
+float curv_flat_abs = syminfo.mintick * curv_flat_ticks
+curv_flat = not na(price_bar_curvature) and math.abs(price_bar_curvature) <= curv_flat_abs
+curv_pos  = not na(price_bar_curvature) and price_bar_curvature > curv_flat_abs
+curv_neg  = not na(price_bar_curvature) and price_bar_curvature < -curv_flat_abs
+
+// Symmetric IV move (VXN), per trading-day sqrt — display convention unchanged
+daily_move = close * (vxn / 100.0) * math.sqrt(1.0 / 252.0) * iv_mult
+upper_band = close + daily_move
+lower_band = close - daily_move
+
+upper_plot = plot(show_bands ? upper_band : na, "Upper IV", col_band_up, linewidth=1, style=plot.style_line)
+lower_plot = plot(show_bands ? lower_band : na, "Lower IV", col_band_dn, linewidth=1, style=plot.style_line)
+fill(upper_plot, lower_plot, color=color.new(color.orange, 94), title="IV band fill")
+
+ito_up_plot = plot(show_ito_bands ? ito_upper : na, "Ito upper", col_ito_up, linewidth=1, style=plot.style_line)
+ito_dn_plot = plot(show_ito_bands ? ito_lower : na, "Ito lower", col_ito_dn, linewidth=1, style=plot.style_line)
+fill(ito_up_plot, ito_dn_plot, color=color.new(color.teal, 94), title="Ito fill")
+
+// ═══════════════════════════════════════════════════════════════════════════
+// STRUCTURAL LEVELS
+// ═══════════════════════════════════════════════════════════════════════════
+
+pd_high = request.security(syminfo.tickerid, "D", high[1], lookahead=barmerge.lookahead_off)
+pd_low  = request.security(syminfo.tickerid, "D", low[1], lookahead=barmerge.lookahead_off)
+
+is_new_day = ta.change(time("D")) != 0
+
+var line pdh_line = na
+var line pdl_line = na
+
+if show_pdhl and is_new_day
+    line.delete(pdh_line)
+    line.delete(pdl_line)
+    pdh_line := line.new(bar_index, pd_high, bar_index + 1, pd_high, extend=extend.right, color=col_pdh, width=1, style=line.style_dashed)
+    pdl_line := line.new(bar_index, pd_low, bar_index + 1, pd_low, extend=extend.right, color=col_pdl, width=1, style=line.style_dashed)
+    if show_labels
+        label.new(bar_index, pd_high, "PDH " + str.tostring(pd_high, "#.00"), style=label.style_label_left, color=color.new(col_pdh, 80), textcolor=col_pdh, size=size.small)
+        label.new(bar_index, pd_low, "PDL " + str.tostring(pd_low, "#.00"), style=label.style_label_left, color=color.new(col_pdl, 80), textcolor=col_pdl, size=size.small)
+
+is_rth_open = not na(time(timeframe.period, rth_open_time)) and na(time(timeframe.period, rth_open_time)[1])
+
+var line rth_line = na
+
+if show_rth_open and is_rth_open
+    line.delete(rth_line)
+    rth_line := line.new(bar_index, open, bar_index + 1, open, extend=extend.right, color=col_rth_open, width=1, style=line.style_dotted)
+    if show_labels
+        label.new(bar_index, open, "RTH Open " + str.tostring(open, "#.00"), style=label.style_label_left, color=color.new(col_rth_open, 80), textcolor=col_rth_open, size=size.small)
+
+in_on_session = not na(time(timeframe.period, on_session))
+
+var float on_h_running = na
+var float on_l_running = na
+
+if not in_on_session[1] and in_on_session
+    on_h_running := high
+    on_l_running := low
+else if in_on_session
+    on_h_running := math.max(on_h_running, high)
+    on_l_running := math.min(on_l_running, low)
+
+var float on_h_val = na
+var float on_l_val = na
+var line on_h_line = na
+var line on_l_line = na
+
+if show_on_range and is_rth_open
+    on_h_val := on_h_running
+    on_l_val := on_l_running
+    line.delete(on_h_line)
+    line.delete(on_l_line)
+    on_h_line := line.new(bar_index, on_h_val, bar_index + 1, on_h_val, extend=extend.right, color=col_on_h, width=1, style=line.style_dashed)
+    on_l_line := line.new(bar_index, on_l_val, bar_index + 1, on_l_val, extend=extend.right, color=col_on_l, width=1, style=line.style_dashed)
+    if show_labels
+        label.new(bar_index, on_h_val, "ON High " + str.tostring(on_h_val, "#.00"), style=label.style_label_left, color=color.new(col_on_h, 80), textcolor=col_on_h, size=size.small)
+        label.new(bar_index, on_l_val, "ON Low " + str.tostring(on_l_val, "#.00"), style=label.style_label_left, color=color.new(col_on_l, 80), textcolor=col_on_l, size=size.small)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ITO CONFLUENCE (secondary markers)
+// ═══════════════════════════════════════════════════════════════════════════
+
+ito_buy_raw =
+     not na(ito_drift) and ito_drift > 0 and curv_pos and
+     not na(ito_lower) and close <= ito_lower
+
+ito_sell_raw =
+     not na(ito_drift) and ito_drift < 0 and curv_neg and
+     not na(ito_upper) and close >= ito_upper
+
+ito_buy  = ito_buy_raw and not ito_buy_raw[1]
+ito_sell = ito_sell_raw and not ito_sell_raw[1]
+
+plotshape(show_ito_sig and ito_buy, "Ito Buy", shape.diamond, location.belowbar, color.new(color.teal, 0), 0, na, na, true, size.tiny)
+plotshape(show_ito_sig and ito_sell, "Ito Sell", shape.diamond, location.abovebar, color.new(color.orange, 0), 0, na, na, true, size.tiny)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// TABLE
+// ═══════════════════════════════════════════════════════════════════════════
+
+var table info = table.new(position.top_right, 2, 15,
+     bgcolor=color.new(color.black, 70),
+     border_color=color.new(color.gray, 60), border_width=1,
+     frame_color=color.new(color.gray, 40), frame_width=1)
+
+if barstate.islast
+    regime_str   = rv_gt_iv ? "EXPANDING" : rv_lt_iv ? "CONTRACTING" : "NEUTRAL"
+    regime_color = rv_gt_iv ? color.red : rv_lt_iv ? color.green : color.gray
+    bias_str     = rv_gt_iv ? "Breakout bias" : rv_lt_iv ? "Mean revert bias" : "—"
+    trend_str    = ema_fast > ema_slow ? "UP ▲" : ema_fast < ema_slow ? "DOWN ▼" : "FLAT"
+    trend_col    = ema_fast > ema_slow ? color.lime : ema_fast < ema_slow ? color.red : color.gray
+    adx_str      = str.tostring(adx_val, "#.0") + (adx_ok ? " ✓" : " ✗")
+    htf_str      = not use_htf ? "OFF" : htf_bull ? "BULL OK" : htf_bear ? "BEAR OK" : "MIXED"
+    drift_val    = not na(ito_drift) ? ito_drift * 100.0 : na
+    drift_str    = na(drift_val) ? "—" : drift_val > 0 ? "POSITIVE ▲" : drift_val < 0 ? "NEGATIVE ▼" : "FLAT"
+    drift_color  = na(drift_val) ? color.gray : drift_val > 0 ? color.lime : drift_val < 0 ? color.red : color.gray
+    schoem_val   = not na(schoemaker) ? schoemaker * 100.0 : na
+    drag_str     = vol_drag_on ? "VOL DRAG > |μ|" : "|μ| ≥ VOL DRAG"
+    drag_color   = vol_drag_on ? color.orange : color.lime
+    curv_str     = curv_pos ? "CONVEX +" : curv_neg ? "CONCAVE -" : curv_flat ? "FLAT" : "—"
+    curv_color   = curv_pos ? color.lime : curv_neg ? color.red : color.gray
+    sig_str      = bull_signal ? "▲ TREND BUY" : bear_signal ? "▼ TREND SELL" : ito_buy ? "◆ ITO BUY" : ito_sell ? "◆ ITO SELL" : "—"
+    sig_color    = (bull_signal or ito_buy) ? color.lime : (bear_signal or ito_sell) ? color.red : color.gray
+    ito_na       = "—"
+
+    table.cell(info, 0, 0, "TREND + VOL", text_color=color.white, text_size=size.small, bgcolor=color.new(color.gray, 60))
+    table.cell(info, 1, 0, "ITO / RV", text_color=color.teal, text_size=size.small, bgcolor=color.new(color.gray, 60))
+    table.cell(info, 0, 1, "VXN (IV)", text_color=color.gray, text_size=size.small)
+    table.cell(info, 1, 1, str.tostring(vxn, "#.00") + "%", text_color=color.white, text_size=size.small)
+    table.cell(info, 0, 2, "RV 20d", text_color=color.gray, text_size=size.small)
+    table.cell(info, 1, 2, str.tostring(rv_20, "#.00") + "%", text_color=color.white, text_size=size.small)
+    table.cell(info, 0, 3, "RV 5d", text_color=color.gray, text_size=size.small)
+    table.cell(info, 1, 3, str.tostring(rv_5, "#.00") + "%", text_color=color.white, text_size=size.small)
+    table.cell(info, 0, 4, "Regime", text_color=color.gray, text_size=size.small)
+    table.cell(info, 1, 4, regime_str, text_color=regime_color, text_size=size.small)
+    table.cell(info, 0, 5, "Bias", text_color=color.gray, text_size=size.small)
+    table.cell(info, 1, 5, bias_str, text_color=color.yellow, text_size=size.small)
+    table.cell(info, 0, 6, "EMA trend", text_color=color.gray, text_size=size.small)
+    table.cell(info, 1, 6, trend_str, text_color=trend_col, text_size=size.small)
+    table.cell(info, 0, 7, "ADX", text_color=color.gray, text_size=size.small)
+    table.cell(info, 1, 7, adx_str, text_color=adx_ok ? color.lime : color.red, text_size=size.small)
+    table.cell(info, 0, 8, "HTF", text_color=color.gray, text_size=size.small)
+    table.cell(info, 1, 8, htf_str, text_color=color.white, text_size=size.small)
+    table.cell(info, 0, 9, show_ito_table ? "Ito drift (μ−½σ²)" : ito_na, text_color=color.gray, text_size=size.small)
+    table.cell(info, 1, 9, show_ito_table ? drift_str : ito_na, text_color=show_ito_table ? drift_color : color.gray, text_size=size.small)
+    table.cell(info, 0, 10, show_ito_table ? "½σ² drag %" : ito_na, text_color=color.gray, text_size=size.small)
+    table.cell(info, 1, 10, show_ito_table and not na(schoem_val) ? str.tostring(schoem_val, "#.00") + "%" : ito_na, text_color=color.orange, text_size=size.small)
+    table.cell(info, 0, 11, show_ito_table ? "Drag vs drift" : ito_na, text_color=color.gray, text_size=size.small)
+    table.cell(info, 1, 11, show_ito_table ? drag_str : ito_na, text_color=show_ito_table ? drag_color : color.gray, text_size=size.small)
+    table.cell(info, 0, 12, show_ito_table ? "Bar curvature" : ito_na, text_color=color.gray, text_size=size.small)
+    table.cell(info, 1, 12, show_ito_table ? curv_str : ito_na, text_color=show_ito_table ? curv_color : color.gray, text_size=size.small)
+    table.cell(info, 0, 13, "Ito σ", text_color=color.gray, text_size=size.small)
+    table.cell(info, 1, 13, ito_sigma_source, text_color=color.white, text_size=size.small)
+    table.cell(info, 0, 14, "Last signal", text_color=color.gray, text_size=size.small)
+    table.cell(info, 1, 14, sig_str, text_color=sig_color, text_size=size.small)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ALERTS
+// ═══════════════════════════════════════════════════════════════════════════
+
+alertcondition(bull_signal, "Trend Buy (filtered)", "Bullish EMA crossover, filters OK")
+alertcondition(bear_signal, "Trend Sell (filtered)", "Bearish EMA crossover, filters OK")
+alertcondition(ito_buy, "Ito Buy confluence", "Positive Ito drift, convex bar curvature, at lower Ito band")
+alertcondition(ito_sell, "Ito Sell confluence", "Negative Ito drift, concave bar curvature, at upper Ito band")
+alertcondition(ta.crossover(rv_20, vxn), "RV crossed above IV", "Vol expanding vs VXN")
+alertcondition(ta.crossunder(rv_20, vxn), "RV crossed below IV", "Vol contracting vs VXN")
+alertcondition(close >= upper_band, "Price at upper IV band", "Close >= upper VXN band")
+alertcondition(close <= lower_band, "Price at lower IV band", "Close <= lower VXN band")
+alertcondition(not na(ito_upper) and close >= ito_upper, "Price at Ito upper", "Close >= Ito upper GBM band")
+alertcondition(not na(ito_lower) and close <= ito_lower, "Price at Ito lower", "Close <= Ito lower GBM band")
+alertcondition(vol_drag_on, "Vol drag > |drift|", "½σ² exceeds |μ| — choppy regime flag")
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PHASE 6 — TESTING (manual)
+// ═══════════════════════════════════════════════════════════════════════════
+// 1) NQ 15m/1h: trend arrows vs chop; toggle RV gates and compare frequency.
+// 2) Ito σ = RV20 vs VXN: band width and Ito alerts should shift materially on same TF.
+// 3) 5m chart: bars_per_year is large — drift/bands react faster; sanity-check vs daily chart.
+// 4) HTF = 1D on intraday chart: rare filtered buys; confirm lookahead_off behaviour.
+// 5) INDEX:VXN availability: if `na`, IV bands and regime degrade — spot-check equities index session.
+// Log returns: guarded against zero prior close to avoid undefined log.
